@@ -36,9 +36,9 @@ def hsv_color_masks(img_bgr):
 
     # Range for blue, green, white color in HSV
     hsv_ranges = {
-        "green": {"lower": (40, 40, 40), "upper": (90, 255, 255)},
-        "white": {"lower": (0, 0, 180), "upper": (180, 60, 255)},
-        "blue": {"lower": (90, 50, 50), "upper": (140, 255, 255)}
+        "green": {"lower": (35, 30, 40), "upper": (85, 255, 255)},
+        "white": {"lower": (95, 30, 40), "upper": (145, 255, 255)},
+        "blue": {"lower": (0, 0, 150), "upper": (179, 80, 255)}
     }
 
     # Prepare combined mask
@@ -72,22 +72,6 @@ def remove_long_lines(mask, orig_img=None, min_len=150, thickness=3):
     cleaned = cv2.bitwise_and(mask, cv2.bitwise_not(line_mask))
     return cleaned, line_mask
 
-# def deskew_image_using_mask(img_bgr, mask):
-#     deskew_min_pixels = 50
-#     # Compute angle from mask's non-zero pixels using cv.minAreaRect on their coords
-#     coords = np.column_stack(np.where(mask > 0))
-#     if coords.shape[0] < deskew_min_pixels:
-#         return img_bgr, 0.0
-#     rect = cv2.minAreaRect(coords)
-#     angle = rect[-1]
-#     if angle < -45:
-#         angle = -(90 + angle)
-#     else:
-#         angle = -angle
-#     (h, w) = img_bgr.shape[:2]
-#     M = cv2.getRotationMatrix2D((w//2, h//2), angle, 1.0)
-#     rotated = cv2.warpAffine(img_bgr, M, (w, h), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE)
-#     return rotated, angle
 
 def apply_clahe(gray):
     clipLimit = 3.0
@@ -158,16 +142,11 @@ for i in range(1, nb_components):
     if area >= 8 and h >= 6:   # tune thresholds if needed
         filtered[labels == i] = 255
 
-# 7) Deskew using the filtered mask (rotate original denoised image)
-# rotated, angle = deskew_image_using_mask(img_deno, filtered)
-# cv2.imwrite(os.path.join(OUT_DIR, '7_rotated.png'), rotated)
-# print(f"Deskew angle applied: {angle:.2f} degrees")
-
-# 8) Convert to grayscale and CLAHE
+# 7) Convert to grayscale and CLAHE
 gray_rot = cv2.cvtColor(img_deno, cv2.COLOR_BGR2GRAY)
 gray_clahe = apply_clahe(gray_rot)
 
-# 9) Binarize (choose adaptive or otsu)
+# 8) Binarize (choose adaptive or otsu)
 # choose method automatically: if a lot of mask content, try otsu; otherwise adaptive
 method = 'otsu' if np.count_nonzero(filtered) > 50 else 'adaptive'
 adaptive_thresh = {"blockSize": 31, "C": 10}
@@ -176,11 +155,15 @@ if method == 'otsu':
 else:
     bin_img = binarize_image(gray_clahe, method='adaptive', adaptive=adaptive_thresh)
 
+
 # thickening the font
 bin_img = thick_font(bin_img)
 
+# Light Anti-Alias
+# bin_img = cv2.GaussianBlur(bin_img, (3, 3), 0.2)
 
-# 10) Small morphological cleanup on binary (strengthen glyphs)
+
+# 9) Small morphological cleanup on binary (strengthen glyphs)
 kernel_small = cv2.getStructuringElement(cv2.MORPH_RECT, (2,2))
 final_dilate_iter = 1
 final_erode_iter = 0
@@ -190,7 +173,7 @@ if final_erode_iter > 0:
     bin_img = cv2.morphologyEx(bin_img, cv2.MORPH_ERODE, kernel_small, iterations=final_erode_iter)
 
 
-# 11) Final scale if needed for OCR engines
+# 10) Final scale if needed for OCR engines
 final_scale_for_ocr = 1.0
 if final_scale_for_ocr != 1.0:
     bin_img = resize_keep_ar(bin_img, final_scale_for_ocr)

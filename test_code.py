@@ -17,16 +17,15 @@ os.makedirs(OUT_DIR, exist_ok=True)
 
 # ---------- Parameters (tune these) ----------
 params = {
-    "upscale_factor": 2.0,               # initial upscale (2.0 = 2x)
-    "denoise_method": "bilateral",       # 'bilateral' or 'nl_means' or None
+    "upscale_factor": 1.5,               # initial upscale (2.0 = 2x)
+    "denoise_method": "nl_means",       # 'bilateral' or 'nl_means' or None
     "bilateral": {"d":9, "sigmaColor":75, "sigmaSpace":75},
     "nl_means": {"h":10},
     # HSV ranges for color masks -- tune these with an HSV picker if needed
-    "hsv_masks": {
-        "green": {"lower": (40, 40, 40), "upper": (90, 255, 255)},
-        "white": {"lower": (0, 0, 180), "upper": (180, 60, 255)},
-        "blue":  {"lower": (90, 50, 50), "upper": (140, 255, 255)},
-        # add others if needed
+    "hsv_masks" : {
+        "green": {"lower": (45, 50, 50), "upper": (75, 255, 255)},
+        "blue":  {"lower": (105, 50, 50), "upper": (135, 255, 255)},
+        "white": {"lower": (0, 0, 180), "upper": (179, 60, 255)}
     },
     "morph_kernel_small": (3,3),
     "morph_kernel_long": (25,1),         # used for detecting long horizontal structures
@@ -44,7 +43,7 @@ def resize_keep_ar(img, scale=1.0):
     h,w = img.shape[:2]
     if scale == 1.0:
         return img
-    return cv2.resize(img, (int(w*scale), int(h*scale)), interpolation=cv2.INTER_CUBIC)
+    return cv2.resize(img, (int(w*scale), int(h*scale)), interpolation=cv2.INTER_LANCZOS4)
 
 def denoise(img, method="bilateral"):
     if method == "bilateral":
@@ -52,13 +51,8 @@ def denoise(img, method="bilateral"):
         return cv2.bilateralFilter(img, d=p["d"], sigmaColor=p["sigmaColor"], sigmaSpace=p["sigmaSpace"])
     elif method == "nl_means":
         p = params["nl_means"]
-        # convert to grayscale for fast Non-Local Means denoising
-        if len(img.shape) == 3:
-            gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-            den = cv2.fastNlMeansDenoising(gray, h=p["h"])
-            return cv2.cvtColor(den, cv2.COLOR_GRAY2BGR)
-        else:
-            return cv2.fastNlMeansDenoising(img, h=p["h"])
+        # FIX: preserve color for HSV masking
+        return cv2.fastNlMeansDenoisingColored(img, None, p["h"], p["h"], 7, 21)
     else:
         return img.copy()
 
@@ -142,11 +136,11 @@ if img is None:
 
 # 1) Upscale
 img_up = resize_keep_ar(img, params["upscale_factor"])
-cv2.imwrite(os.path.join(OUT_DIR, '1_upscaled.png'), img_up)
+# cv2.imwrite(os.path.join(OUT_DIR, '1_upscaled.png'), img_up)
 
 # 2) Denoise (preserve edges)
 img_deno = denoise(img_up, method=params["denoise_method"])
-cv2.imwrite(os.path.join(OUT_DIR, '2_denoised.png'), img_deno)
+# cv2.imwrite(os.path.join(OUT_DIR, '2_denoised.png'), img_deno)
 
 # 3) Color masks: green, white, blue (combine)
 mask_combined, masks = hsv_color_masks(img_deno, params["hsv_masks"])
@@ -156,7 +150,7 @@ for k,v in masks.items():
 
 # 4) Morphological clean on mask
 mask_clean = morph_clean(mask_combined, kernel_size=params["morph_kernel_small"], close_iter=1, open_iter=1)
-cv2.imwrite(os.path.join(OUT_DIR, '4_mask_clean.png'), mask_clean)
+# cv2.imwrite(os.path.join(OUT_DIR, '4_mask_clean.png'), mask_clean)
 
 # 5) Remove long CAD drawing lines (use mask edges via Hough)
 mask_no_lines, line_mask = remove_long_lines(mask_clean, orig_img=img_deno, min_len=params["remove_line_min_len"], thickness=3)
@@ -179,14 +173,14 @@ cv2.imwrite(os.path.join(OUT_DIR, '6_mask_filtered_cc.png'), filtered)
 # 7) Skip deskew - just use the filtered mask and denoised image directly
 rotated = img_deno.copy()  # no rotation applied
 angle = 0.0
-cv2.imwrite(os.path.join(OUT_DIR, '7_rotated.png'), rotated)
-print(f"Deskew skipped. Angle set to: {angle:.2f} degrees")
+# cv2.imwrite(os.path.join(OUT_DIR, '7_rotated.png'), rotated)
+# print(f"Deskew skipped. Angle set to: {angle:.2f} degrees")
 
 # 8) Convert to grayscale and CLAHE
 gray_rot = cv2.cvtColor(rotated, cv2.COLOR_BGR2GRAY)
-cv2.imwrite(os.path.join(OUT_DIR, '8_gray_rotated.png'), gray_rot)
+# cv2.imwrite(os.path.join(OUT_DIR, '8_gray_rotated.png'), gray_rot)
 gray_clahe = apply_clahe(gray_rot)
-cv2.imwrite(os.path.join(OUT_DIR, '8_gray_clahe.png'), gray_clahe)
+# cv2.imwrite(os.path.join(OUT_DIR, '8_gray_clahe.png'), gray_clahe)
 
 # 9) Binarize (choose adaptive or otsu)
 # choose method automatically: if a lot of mask content, try otsu; otherwise adaptive
@@ -195,7 +189,7 @@ if method == 'otsu':
     bin_img = binarize_image(gray_clahe, method='otsu')
 else:
     bin_img = binarize_image(gray_clahe, method='adaptive', adaptive=params["adaptive_thresh"])
-cv2.imwrite(os.path.join(OUT_DIR, '9_binarized_raw.png'), bin_img)
+# cv2.imwrite(os.path.join(OUT_DIR, '9_binarized_raw.png'), bin_img)
 
 # 10) Small morphological cleanup on binary (strengthen glyphs)
 kernel_small = cv2.getStructuringElement(cv2.MORPH_RECT, (2,2))
@@ -203,7 +197,7 @@ if params["final_dilate_iter"] > 0:
     bin_img = cv2.morphologyEx(bin_img, cv2.MORPH_DILATE, kernel_small, iterations=params["final_dilate_iter"])
 if params["final_erode_iter"] > 0:
     bin_img = cv2.morphologyEx(bin_img, cv2.MORPH_ERODE, kernel_small, iterations=params["final_erode_iter"])
-cv2.imwrite(os.path.join(OUT_DIR, '10_binarized_final.png'), bin_img)
+# cv2.imwrite(os.path.join(OUT_DIR, '10_binarized_final.png'), bin_img)
 
 # 11) Final scale if needed for OCR engines
 if params["final_scale_for_ocr"] != 1.0:
