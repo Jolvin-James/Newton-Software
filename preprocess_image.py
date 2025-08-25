@@ -1,7 +1,7 @@
 import cv2
 import numpy as np
 
-image_path = 'data/1.png'
+image_path = 'data/3.png'
 
 
 def resize_keep_ar(img, scale=1.0):
@@ -36,9 +36,9 @@ def hsv_color_masks(img_bgr):
 
     # Range for blue, green, white color in HSV
     hsv_ranges = {
-        "green": {"lower": (35, 30, 40), "upper": (85, 255, 255)},
-        "white": {"lower": (95, 30, 40), "upper": (145, 255, 255)},
-        "blue": {"lower": (0, 0, 150), "upper": (179, 80, 255)}
+        "green": {"lower": (35, 30, 40), "upper": (105, 255, 255)},
+        "white": {"lower": (85, 30, 40), "upper": (165, 255, 255)},
+        "blue": {"lower": (0, 0, 130), "upper": (179, 80, 255)}
     }
 
     # Prepare combined mask
@@ -59,9 +59,9 @@ def morph_clean(mask, kernel_size=(3,3), close_iter=1, open_iter=1):
     m = cv2.morphologyEx(m, cv2.MORPH_OPEN, kernel, iterations=open_iter)
     return m
 
-def remove_long_lines(mask, orig_img=None, min_len=150, thickness=3):
+def remove_long_lines(mask, orig_img=None, min_len=120, thickness=3):
     edges = cv2.Canny(mask, 50, 150)
-    lines = cv2.HoughLinesP(edges, 1, np.pi/180, threshold=120, minLineLength=min_len, maxLineGap=20)
+    lines = cv2.HoughLinesP(edges, 1, np.pi/180, threshold=120, minLineLength=min_len, maxLineGap=40)
     line_mask = np.zeros_like(mask)
     if lines is None:
         return mask, line_mask
@@ -73,6 +73,7 @@ def remove_long_lines(mask, orig_img=None, min_len=150, thickness=3):
     return cleaned, line_mask
 
 
+
 def apply_clahe(gray):
     clipLimit = 3.0
     tileGridSize = (8,8)
@@ -81,23 +82,19 @@ def apply_clahe(gray):
 
 def binarize_image(gray, method='otsu', adaptive=None):
     if method == 'otsu':
-        _, th = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-        # Decide whether to invert - prefer black text on white background
-        if np.mean(th) < 127:
-            th = cv2.bitwise_not(th)
-        return th
+        _, th = cv2.threshold(gray, 10, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
     elif method == 'adaptive':
         bs = adaptive.get("blockSize", 31)
         C = adaptive.get("C", 10)
         th = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
                                    cv2.THRESH_BINARY, bs, C)
-        if np.mean(th) < 127:
-            th = cv2.bitwise_not(th)
-        return th
     else:
         # fallback simple threshold
         _, th = cv2.threshold(gray, 128, 255, cv2.THRESH_BINARY)
-        return th
+
+    if np.mean(th) < 127:
+        th = cv2.bitwise_not(th)
+    return th
 
 def thick_font(img):
     img = cv2.bitwise_not(img)
@@ -105,7 +102,6 @@ def thick_font(img):
     img = cv2.dilate(img, kernel, iterations=1)
     img = cv2.bitwise_not(img)
     return img
-
 
 
 # ---------- Pipeline execution ----------
@@ -128,7 +124,7 @@ mask_combined = hsv_color_masks(img_deno)
 mask_clean = morph_clean(mask_combined, kernel_size=(3,3), close_iter=1, open_iter=1)
 
 # 5) Remove long CAD drawing lines (use mask edges via Hough)
-mask_no_lines, line_mask = remove_long_lines(mask_clean, orig_img=img_deno, min_len=150, thickness=3)
+mask_no_lines, line_mask = remove_long_lines(mask_clean, orig_img=img_deno)
 
 # 6) Optional: Connected component filtering (remove tiny blobs)
 nb_components, labels, stats, centroids = cv2.connectedComponentsWithStats(mask_no_lines, connectivity=8)
@@ -148,19 +144,18 @@ gray_clahe = apply_clahe(gray_rot)
 
 # 8) Binarize (choose adaptive or otsu)
 # choose method automatically: if a lot of mask content, try otsu; otherwise adaptive
-method = 'otsu' if np.count_nonzero(filtered) > 50 else 'adaptive'
-adaptive_thresh = {"blockSize": 31, "C": 10}
-if method == 'otsu':
-    bin_img = binarize_image(gray_clahe, method='otsu')
-else:
-    bin_img = binarize_image(gray_clahe, method='adaptive', adaptive=adaptive_thresh)
+# method = 'otsu' if np.count_nonzero(filtered) > 50 else 'adaptive'
+# adaptive_thresh = {"blockSize": 31, "C": 10}
+# if method == 'otsu':
+#     bin_img = binarize_image(gray_clahe, method='otsu')
+# else:
+#     bin_img = binarize_image(gray_clahe, method='adaptive', adaptive=adaptive_thresh)
+bin_img = binarize_image(gray_clahe, method='otsu')
 
 
 # thickening the font
 bin_img = thick_font(bin_img)
 
-# Light Anti-Alias
-# bin_img = cv2.GaussianBlur(bin_img, (3, 3), 0.2)
 
 
 # 9) Small morphological cleanup on binary (strengthen glyphs)
@@ -178,7 +173,7 @@ final_scale_for_ocr = 1.0
 if final_scale_for_ocr != 1.0:
     bin_img = resize_keep_ar(bin_img, final_scale_for_ocr)
 
-final_path = 'temp/preprocessed_for_ocr.png'
+final_path = 'temp/preprocessed_for_ocr_3.png'
 cv2.imwrite(final_path, bin_img)
 
 print("Preprocessing complete. Saved intermediate files to:", final_path)
