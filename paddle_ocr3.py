@@ -34,7 +34,8 @@ def filter_results(ocr_results, score_threshold=0.7):
     return [item for item in ocr_results if item[1] >= score_threshold]
 
 def _center(box):
-    xs = [p[0] for p in box]; ys = [p[1] for p in box]
+    xs = [p[0] for p in box]
+    ys = [p[1] for p in box]
     return sum(xs)/len(xs), sum(ys)/len(ys)
 
 def extract_beam_numbers_and_sizes(results):
@@ -73,7 +74,127 @@ def extract_beam_numbers_and_sizes(results):
         })
     return extracted
 
+def extract_top_reinforcement(results, beam_center_y=None,
+                              min_cluster_separation_ratio=0.08,
+                              top_fraction_fallback=0.40,
+                              beam_center_tol=2.0):
+    """
+    Extract only TOP reinforcement into LEFT TOP, MID TOP, RIGHT TOP.
+    results: iterable of (text, score, box) as in your OCR output.
+    - Uses 1D k-means style clustering on cy to separate top vs bottom.
+    - If clustering isn't strong enough, falls back to taking top_fraction_fallback of bars.
+    Returns dict {"LEFT TOP": "...", "MID TOP": "...", "RIGHT TOP": "..."}
+    """
+    bar_pattern = re.compile(r"(\+?\d+)\s*-\s*(\d+)\s*\(([TC])\)", re.IGNORECASE)
 
+    bars = []
+    for text, score, box in results:
+        if not text:
+            continue
+        for m in bar_pattern.finditer(text):
+            count_raw, dia, pos = m.groups()
+            try:
+                count = int(count_raw.replace("+", ""))
+            except Exception:
+                # keep raw if cannot parse, but normally it will parse
+                count = count_raw
+            cx, cy = _center(box)
+            # normalized text (removes leading +); keep original style if you prefer
+            normalized = f"{count}-{dia}({pos.upper()})"
+            bars.append({
+                "text": normalized,
+                "count": count,
+                "dia": int(dia),
+                "pos": pos.upper(),  # 'T' or 'C'
+                "cx": cx, "cy": cy
+            })
+
+    # default empty result
+    if not bars:
+        return {"LEFT TOP": "", "MID TOP": "", "RIGHT TOP": ""}
+
+    ys = [b["cy"] for b in bars]
+    xmin, xmax = min(b["cx"] for b in bars), max(b["cx"] for b in bars)
+    ymin, ymax = min(ys), max(ys)
+    y_range = ymax - ymin if ymax - ymin != 0 else 1.0
+
+    # If only one bar, treat it as top (fallback)
+    if len(bars) == 1:
+        top_bars = bars.copy()
+    else:
+        # 1D two-cluster (k=2) iterative assignment on cy
+        # init centers
+        c1 = ymin
+        c2 = ymax
+        for _ in range(20):
+            cluster1 = [b for b in bars if abs(b["cy"] - c1) <= abs(b["cy"] - c2)]
+            cluster2 = [b for b in bars if abs(b["cy"] - c2) < abs(b["cy"] - c1)]
+            new_c1 = sum(b["cy"] for b in cluster1) / len(cluster1) if cluster1 else c1
+            new_c2 = sum(b["cy"] for b in cluster2) / len(cluster2) if cluster2 else c2
+            if abs(new_c1 - c1) < 1e-3 and abs(new_c2 - c2) < 1e-3:
+                break
+            c1, c2 = new_c1, new_c2
+
+        # choose the cluster with smaller mean cy as top
+        center1 = sum(b["cy"] for b in cluster1) / len(cluster1) if cluster1 else float('inf')
+        center2 = sum(b["cy"] for b in cluster2) / len(cluster2) if cluster2 else float('inf')
+        top_cluster = cluster1 if center1 < center2 else cluster2
+        other_cluster = cluster2 if top_cluster is cluster1 else cluster1
+        center_dist = abs(center1 - center2)
+
+        # accept clustering only if cluster centers are sufficiently separated relative to y_range
+        if center_dist >= (min_cluster_separation_ratio * y_range):
+            top_bars = top_cluster
+        else:
+            # fallback: take bars in top X% of the Y range
+            cutoff = ymin + top_fraction_fallback * y_range
+            top_bars = [b for b in bars if b["cy"] <= cutoff]
+            if not top_bars:
+                # last resort: take the half with smaller cy values
+                top_bars = sorted(bars, key=lambda b: b["cy"])[: max(1, len(bars)//2)]
+
+    # If beam_center_y given, filter to above it (smaller cy). Note: changed to beam_center_y - tol
+    if beam_center_y is not None:
+        top_filtered = [b for b in top_bars if b["cy"] <= (beam_center_y - beam_center_tol)]
+        if top_filtered:
+            top_bars = top_filtered
+        # if filtering removed everything, keep previously computed top_bars (don't force empty)
+
+    # Now assign to left/mid/right by x-position
+    top_bars.sort(key=lambda b: b["cx"])
+    xs = [b["cx"] for b in top_bars]
+    xmin = min(xs); xmax = max(xs)
+    width = xmax - xmin if xmax - xmin != 0 else 1.0
+    third = width / 3.0
+
+    def region_for_x(cx):
+        if cx <= xmin + third:
+            return "LEFT"
+        elif cx >= xmin + 2*third:
+            return "RIGHT"
+        else:
+            return "MID"
+
+    reinforcement = {"LEFT TOP": [], "MID TOP": [], "RIGHT TOP": []}
+
+    for b in top_bars:
+        r = region_for_x(b["cx"])
+        if b["pos"] == "T":
+            if r == "MID":
+                # replicate mid top into all three
+                reinforcement["LEFT TOP"].append(b["text"])
+                reinforcement["MID TOP"].append(b["text"])
+                reinforcement["RIGHT TOP"].append(b["text"])
+            else:
+                reinforcement[f"{r} TOP"].append(b["text"])
+        elif b["pos"] == "C":
+            # rule: C values only go to LEFT or RIGHT (not MID)
+            if r in ("LEFT", "RIGHT"):
+                reinforcement[f"{r} TOP"].append(b["text"])
+
+    # join multiple values with comma
+    reinforcement = {k: " , ".join(v) if v else "" for k, v in reinforcement.items()}
+    return reinforcement
 
 
 def extract_shear_stirrups(results):
@@ -202,9 +323,11 @@ def process_image(image_path):
         print("Could not select a primary beam."); return
 
     shear  = extract_shear_stirrups(res)
+    top_reinf = extract_top_reinforcement(res, beam_center_y=chosen.get("_cy"))
+
 
     # build a single row for the chosen beam
-    row = {**{h:"" for h in HEADERS}, **chosen, **shear}
+    row = {**{h:"" for h in HEADERS}, **chosen, **shear, **top_reinf}
     # strip helper keys
     row.pop("_cx", None); row.pop("_cy", None); row.pop("_has_wd", None)
 
@@ -212,9 +335,9 @@ def process_image(image_path):
 
     # append/merge into Excel
     _merge_into_excel(df_new)
-    print(f"Saved/updated: {row['BEAM NO']} → {OUTPUT_XLSX}")
+    print(f"Saved/updated: {row['BEAM NO']} -> {OUTPUT_XLSX}")
 
 
 if __name__ == "__main__":
-    image_path = "temp/preprocessed_for_ocr_3.png"  
+    image_path = "temp/preprocessed_for_ocr_1.png"  
     process_image(image_path)
