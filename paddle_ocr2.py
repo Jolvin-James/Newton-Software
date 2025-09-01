@@ -152,6 +152,7 @@ if __name__ == "__main__":
     beam_data = extract_beam_numbers_and_sizes(filtered_results)
     print(beam_data)
 
+    # Extract bottom reinforcement details
     bottom_data = extract_bottom_reinforcement(filtered_results)
     print(bottom_data)
 
