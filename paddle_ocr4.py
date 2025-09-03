@@ -81,7 +81,6 @@ def extract_top_reinforcement(results, beam_center_y=None,
 
     bar_pattern = re.compile(r"(\+?\d+)\s*-\s*(\d+)\s*\(([TC])\)", re.IGNORECASE)
 
-
     bars = []
     for text, score, box in results:
         if not text:
@@ -187,7 +186,6 @@ def extract_top_reinforcement(results, beam_center_y=None,
             if r in ("LEFT", "RIGHT"):
                 reinforcement[f"{r} TOP"].append(b["text"])
 
-    # --- NEW: deduplicate per region ---
     for k in reinforcement:
         reinforcement[k] = list(dict.fromkeys(reinforcement[k]))  # preserve order, remove dupes
 
@@ -255,7 +253,6 @@ def _extract_shear_stirrups_spacing(results):
         spacing["MID SPACE STIRRUPS"] = spc
         return spacing
 
-    # --- NEW LOGIC: Assign based on beam thirds ---
     if beam_xmin is not None and beam_xmax is not None:
         width = beam_xmax - beam_xmin
         left_bound = beam_xmin + width * 0.25
@@ -286,7 +283,6 @@ def _extract_shear_stirrups_spacing(results):
             spacing["RIGHT SPACE STIRRUPS"] = spc
 
     else:
-        # fallback: just use sorted order
         stirrup_matches.sort(key=lambda x: x[2])
         if len(stirrup_matches) == 2:
             left, right = stirrup_matches
@@ -331,7 +327,6 @@ def extract_shear_stirrups(results):
     return spacing
 
 def _collect_value_points(results):
-    """Points that represent 'values' we want to associate with a single beam."""
     pats = [
         re.compile(r"\d+-\d+\([TC]\)", re.IGNORECASE),  # bars like 2-12(T)
         re.compile(r"(\d+)@(\d+)", re.IGNORECASE),      # stirrup spacing
@@ -345,7 +340,6 @@ def _collect_value_points(results):
     return pts
 
 def _select_primary_beam(beam_candidates, results):
-    """Choose exactly one beam per image, the one closest to the value cluster."""
     if not beam_candidates:
         return None
     if len(beam_candidates) == 1:
@@ -432,7 +426,6 @@ def process_image(image_path):
 
 if __name__ == "__main__":
     folder_path = "temp" 
-    # Loop through all files in the folder
     for fname in sorted(os.listdir(folder_path)):
         if fname.lower().endswith((".png", ".jpg", ".jpeg")):
             image_path = os.path.join(folder_path, fname)
