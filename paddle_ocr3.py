@@ -187,9 +187,9 @@ def extract_top_reinforcement(results, beam_center_y=None,
             if r in ("LEFT", "RIGHT"):
                 reinforcement[f"{r} TOP"].append(b["text"])
 
-    # --- NEW: deduplicate per region ---
+    # deduplicate per region
     for k in reinforcement:
-        reinforcement[k] = list(dict.fromkeys(reinforcement[k]))  # preserve order, remove dupes
+        reinforcement[k] = list(dict.fromkeys(reinforcement[k]))  # keep as list
 
     # If exactly one distinct T bar was detected, treat it as global top.
     distinct_t_texts = {b["text"] for b in top_bars if b["pos"] == "T"}
@@ -199,19 +199,111 @@ def extract_top_reinforcement(results, beam_center_y=None,
             for reg in reinforcement:
                 if only_t not in reinforcement[reg]:
                     reinforcement[reg].append(only_t)
-                    
-    # join multiple values with comma
-    reinforcement = {k: " , ".join(v) if v else "" for k, v in reinforcement.items()}
+
+    # replicate near-mid top T bars across all three 
+    mid_x = (xmin + xmax) / 2.0
+    mid_tol = width * 0.25   # allow ±25% of width around center
+    for b in top_bars:
+        if b["pos"] == "T" and abs(b["cx"] - mid_x) <= mid_tol:
+            for reg in reinforcement:
+                if b["text"] not in reinforcement[reg]:
+                    reinforcement[reg].append(b["text"])
+
+    # replicate all MID values into LEFT and RIGHT as well
+    if reinforcement["MID TOP"]:
+        mid_vals = reinforcement["MID TOP"][:]
+        for val in mid_vals:
+            if val not in reinforcement["LEFT TOP"]:
+                reinforcement["LEFT TOP"].append(val)
+            if val not in reinforcement["RIGHT TOP"]:
+                reinforcement["RIGHT TOP"].append(val)
 
     # special case: if only T bars exist but they ended up only in one region,
-    # replicate them across all three (common in combined top labels)
+    # replicate them across all three
     if any(v for v in reinforcement.values()):
         filled = [k for k, v in reinforcement.items() if v]
         if len(filled) == 1:
             only_vals = reinforcement[filled[0]]
-            reinforcement = {k: only_vals for k in reinforcement.keys()}
+            reinforcement = {k: only_vals[:] for k in reinforcement.keys()} 
+
+    # convert lists into comma-joined strings 
+    reinforcement = {k: " , ".join(v) if v else "" for k, v in reinforcement.items()}
 
     return reinforcement
+
+def extract_bottom_reinforcement(results, beam_center_y=None,
+                                 bottom_fraction_fallback=0.40,
+                                 beam_center_tol=5.0):
+
+    bar_pattern = re.compile(r"(\+?\d+)\s*-\s*(\d+)\s*\(([TCB])\)", re.IGNORECASE)
+    bars = []
+
+    # Step 1: parse all reinforcement notations
+    for text, score, box in results:
+        if not text:
+            continue
+        for m in bar_pattern.finditer(text):
+            count_raw, dia, pos = m.groups()
+            try:
+                count = int(count_raw.replace("+", ""))
+            except:
+                count = count_raw
+            cx, cy = _center(box)
+            normalized = f"{count}-{dia}({pos.upper()})"
+            bars.append({
+                "text": normalized,
+                "count": count,
+                "dia": int(dia),
+                "pos": pos.upper(),
+                "cx": cx, "cy": cy
+            })
+
+    reinforcement = {"LEFT BOTTOM": [], "MID BOTTOM": [], "RIGHT BOTTOM": []}
+    if not bars:
+        return reinforcement
+
+    # Step 2: filter for bottom bars (below/near centerline)
+    if beam_center_y is not None:
+        bottom_bars = [b for b in bars if b["cy"] >= (beam_center_y - beam_center_tol)]
+    else:
+        bottom_bars = bars
+
+    if not bottom_bars:
+        ys = [b["cy"] for b in bars]
+        cutoff = (max(ys) + min(ys)) / 2.0
+        bottom_bars = [b for b in bars if b["cy"] >= cutoff]
+
+    # Step 3: geometry split
+    xmin, xmax = min(b["cx"] for b in bottom_bars), max(b["cx"] for b in bottom_bars)
+    width = xmax - xmin if xmax != xmin else 1.0
+    mid_x = (xmin + xmax) / 2.0
+    mid_tol = width * 0.10  # 10% of span considered "mid"
+
+    # Step 4: assign to regions based on rules
+    for b in bottom_bars:
+        if b["pos"] == "T":
+            # replicate in all three regions
+            for reg in reinforcement:
+                if b["text"] not in reinforcement[reg]:
+                    reinforcement[reg].append(b["text"])
+        elif b["pos"] == "C":
+            # only mid
+            if b["text"] not in reinforcement["MID BOTTOM"]:
+                reinforcement["MID BOTTOM"].append(b["text"])
+        else:  # "B" or others → assign by geometry
+            if abs(b["cx"] - mid_x) <= mid_tol:
+                reinforcement["MID BOTTOM"].append(b["text"])
+            elif b["cx"] < mid_x:
+                reinforcement["LEFT BOTTOM"].append(b["text"])
+            else:
+                reinforcement["RIGHT BOTTOM"].append(b["text"])
+
+    # Step 5: clean up (deduplicate + stringify)
+    for k in reinforcement:
+        reinforcement[k] = " , ".join(dict.fromkeys(reinforcement[k]))
+
+    return reinforcement
+
 
 
 def _extract_shear_stirrups_spacing(results):
@@ -255,7 +347,7 @@ def _extract_shear_stirrups_spacing(results):
         spacing["MID SPACE STIRRUPS"] = spc
         return spacing
 
-    # --- NEW LOGIC: Assign based on beam thirds ---
+    # Assign based on beam thirds 
     if beam_xmin is not None and beam_xmax is not None:
         width = beam_xmax - beam_xmin
         left_bound = beam_xmin + width * 0.25
@@ -304,6 +396,7 @@ def _extract_shear_stirrups_spacing(results):
             spacing["RIGHT SPACE STIRRUPS"] = right[1]
 
     return spacing
+
 
 
 def extract_stirrup_legs(results):
@@ -412,10 +505,10 @@ def process_image(image_path):
 
     shear  = extract_shear_stirrups(res)
     top_reinf = extract_top_reinforcement(res, beam_center_y=chosen.get("_cy"))
-
+    bottom_reinf = extract_bottom_reinforcement(res, beam_center_y=chosen.get("_cy"))
 
     # build a single row for the chosen beam
-    row = {**{h:"" for h in HEADERS}, **chosen, **shear, **top_reinf}
+    row = {**{h:"" for h in HEADERS}, **chosen, **shear, **top_reinf, **bottom_reinf}
     # strip helper keys
     row.pop("_cx", None); row.pop("_cy", None); row.pop("_has_wd", None)
 
@@ -427,7 +520,7 @@ def process_image(image_path):
 
 
 # if __name__ == "__main__":
-#     image_path = "temp/preprocessed_for_ocr_28.png"  
+#     image_path = "temp/preprocessed_for_ocr_27.png"  
 #     process_image(image_path)
 
 if __name__ == "__main__":
