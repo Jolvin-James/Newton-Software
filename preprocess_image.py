@@ -1,8 +1,12 @@
 import cv2
+import os
 import numpy as np
 
-image_path = 'data/3.png'
-
+# image_path = 'data/33.png'
+# final_path = 'temp/preprocessed_for_ocr_33.png'
+data_folder = 'data'
+output_folder = 'temp'
+os.makedirs(output_folder, exist_ok=True)
 
 def resize_keep_ar(img, scale=1.0):
     h,w = img.shape[:2]
@@ -36,20 +40,19 @@ def hsv_color_masks(img_bgr):
 
     # Range for blue, green, white color in HSV
     hsv_ranges = {
-        "green": {"lower": (35, 30, 40), "upper": (105, 255, 255)},
-        "white": {"lower": (85, 30, 40), "upper": (165, 255, 255)},
-        "blue": {"lower": (0, 0, 130), "upper": (179, 80, 255)}
+        "green": {"lower": (35, 30, 40), "upper": (95, 255, 255)},
+        # "white": {"lower": (70, 20, 40), "upper": (179, 90, 255)},   
+        "blue":  {"lower": (40, 20, 60), "upper": (170, 125, 255)}  
     }
 
-    # Prepare combined mask
     combined = np.zeros(hsv.shape[:2], dtype=np.uint8)
 
-    # Generate a mask for each color range provided
-    for _, rng in hsv_ranges.items():
+    # A mask for each color range provided
+    for name, rng in hsv_ranges.items():
         lower = np.array(rng["lower"], dtype=np.uint8)
         upper = np.array(rng["upper"], dtype=np.uint8)
         mask = cv2.inRange(hsv, lower, upper)
-        combined = cv2.bitwise_or(combined, mask)
+        combined = cv2.bitwise_or(combined, mask)   
 
     return combined
 
@@ -82,7 +85,7 @@ def apply_clahe(gray):
 
 def binarize_image(gray, method='otsu', adaptive=None):
     if method == 'otsu':
-        _, th = cv2.threshold(gray, 10, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        _, th = cv2.threshold(gray, 20, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
     elif method == 'adaptive':
         bs = adaptive.get("blockSize", 31)
         C = adaptive.get("C", 10)
@@ -96,6 +99,11 @@ def binarize_image(gray, method='otsu', adaptive=None):
         th = cv2.bitwise_not(th)
     return th
 
+# Contrast Stretching (for future use if contrast issues arise)
+def contrast_stretch(img):
+    p2, p98 = np.percentile(img, (2, 98))
+    return cv2.normalize(img, None, 0, 255, cv2.NORM_MINMAX)
+
 def thick_font(img):
     img = cv2.bitwise_not(img)
     kernel = np.ones((1,2),np.uint8)
@@ -103,78 +111,48 @@ def thick_font(img):
     img = cv2.bitwise_not(img)
     return img
 
+def thin_font(img):
+    img = cv2.bitwise_not(img)
+    kernel = np.ones((1,2),np.uint8)
+    img = cv2.erode(img, kernel, iterations=1)
+    img = cv2.bitwise_not(img)
+    return img
 
 # ---------- Pipeline execution ----------
-img = cv2.imread(image_path)
-if img is None:
-    raise FileNotFoundError(f"Input not found: {image_path}")
+# img = cv2.imread(image_path)
+# if img is None:
+#     raise FileNotFoundError(f"Input not found: {image_path}")
 
-# 1) Upscale
-img_up = resize_keep_ar(img, scale=1.5)
+for fname in os.listdir(data_folder):
+    in_path = os.path.join(data_folder, fname)
 
-img_gam = gamma_correction(img_up, gamma=1.4)
+    # Only process image files
+    if not (fname.lower().endswith(".png") or fname.lower().endswith(".jpg") or fname.lower().endswith(".jpeg")):
+        continue
 
-# 2) Denoise (preserve edges)
-img_deno = denoise_image(img_gam, method="nl_means")
+    img = cv2.imread(in_path)
+    if img is None:
+        print(f"Skipping {fname}, could not read.")
+        continue
 
-# 3) Color masks: green, white, blue (combine)
-mask_combined = hsv_color_masks(img_deno)
+    # Convert to grayscale and CLAHE
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    gray_clahe = apply_clahe(gray)
 
-# 4) Morphological clean on mask
-mask_clean = morph_clean(mask_combined, kernel_size=(3,3), close_iter=1, open_iter=1)
+    # Binarize
+    bin_img = binarize_image(gray_clahe, method='otsu')
 
-# 5) Remove long CAD drawing lines (use mask edges via Hough)
-mask_no_lines, line_mask = remove_long_lines(mask_clean, orig_img=img_deno)
+    # Invert for final output (white text on black bg)
+    final_img = 255 - bin_img
 
-# 6) Optional: Connected component filtering (remove tiny blobs)
-nb_components, labels, stats, centroids = cv2.connectedComponentsWithStats(mask_no_lines, connectivity=8)
-filtered = np.zeros_like(mask_no_lines)
-h_mean = img_deno.shape[0] / 100.0
-for i in range(1, nb_components):
-    area = stats[i, cv2.CC_STAT_AREA]
-    w = stats[i, cv2.CC_STAT_WIDTH]
-    h = stats[i, cv2.CC_STAT_HEIGHT]
-    # heuristics: keep components with reasonable area and height
-    if area >= 8 and h >= 6:   # tune thresholds if needed
-        filtered[labels == i] = 255
+    # cv2.imwrite(final_path, final_img)
+    base_name = os.path.splitext(fname)[0]
+    out_path = os.path.join(output_folder, f"preprocessed_for_ocr_{base_name}.png")
+    cv2.imwrite(out_path, final_img)
 
-# 7) Convert to grayscale and CLAHE
-gray_rot = cv2.cvtColor(img_deno, cv2.COLOR_BGR2GRAY)
-gray_clahe = apply_clahe(gray_rot)
-
-# 8) Binarize (choose adaptive or otsu)
-# choose method automatically: if a lot of mask content, try otsu; otherwise adaptive
-# method = 'otsu' if np.count_nonzero(filtered) > 50 else 'adaptive'
-# adaptive_thresh = {"blockSize": 31, "C": 10}
-# if method == 'otsu':
-#     bin_img = binarize_image(gray_clahe, method='otsu')
-# else:
-#     bin_img = binarize_image(gray_clahe, method='adaptive', adaptive=adaptive_thresh)
-bin_img = binarize_image(gray_clahe, method='otsu')
+    print(f"Preprocessed: {fname} -> {out_path}")
 
 
-# thickening the font
-bin_img = thick_font(bin_img)
-
-
-
-# 9) Small morphological cleanup on binary (strengthen glyphs)
-kernel_small = cv2.getStructuringElement(cv2.MORPH_RECT, (2,2))
-final_dilate_iter = 1
-final_erode_iter = 0
-if final_dilate_iter > 0:
-    bin_img = cv2.morphologyEx(bin_img, cv2.MORPH_DILATE, kernel_small, iterations=final_dilate_iter)
-if final_erode_iter > 0:
-    bin_img = cv2.morphologyEx(bin_img, cv2.MORPH_ERODE, kernel_small, iterations=final_erode_iter)
-
-
-# 10) Final scale if needed for OCR engines
-final_scale_for_ocr = 1.0
-if final_scale_for_ocr != 1.0:
-    bin_img = resize_keep_ar(bin_img, final_scale_for_ocr)
-
-final_path = 'temp/preprocessed_for_ocr_3.png'
-cv2.imwrite(final_path, bin_img)
-
-print("Preprocessing complete. Saved intermediate files to:", final_path)
-print("Final preprocessed image:", final_path)
+# print("Preprocessing complete. Saved intermediate files to:", final_path)
+# print("Final preprocessed image:", final_path)
+print("Preprocessing complete. Files saved in:", output_folder)
