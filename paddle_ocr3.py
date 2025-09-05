@@ -1,6 +1,7 @@
 import pandas as pd
 import re
 import os
+import numpy as np
 from paddleocr import PaddleOCR
 
 DEBUG = False
@@ -56,12 +57,10 @@ def extract_beam_numbers_and_sizes(results):
         w = d = None
         has_wd = False
 
-        # try same text
         wd = width_depth_pattern.search(text)
         if wd:
             w, d = map(int, wd.groups()); has_wd = True
         else:
-            # try immediate next text line (common in drawings)
             if i + 1 < len(results):
                 next_text = results[i+1][0]
                 wd2 = width_depth_pattern.search(next_text)
@@ -91,10 +90,8 @@ def extract_top_reinforcement(results, beam_center_y=None,
             try:
                 count = int(count_raw.replace("+", ""))
             except Exception:
-                # keep raw if cannot parse, but normally it will parse
                 count = count_raw
             cx, cy = _center(box)
-            # normalized text (removes leading +); keep original style if you prefer
             normalized = f"{count}-{dia}({pos.upper()})"
             bars.append({
                 "text": normalized,
@@ -104,8 +101,6 @@ def extract_top_reinforcement(results, beam_center_y=None,
                 "cx": cx, "cy": cy
             })
         
-
-    # default empty result
     if not bars:
         return {"LEFT TOP": "", "MID TOP": "", "RIGHT TOP": ""}
 
@@ -146,10 +141,10 @@ def extract_top_reinforcement(results, beam_center_y=None,
             cutoff = ymin + top_fraction_fallback * y_range
             top_bars = [b for b in bars if b["cy"] <= cutoff]
             if not top_bars:
-                # last resort: take the half with smaller cy values
+                # take the half with smaller cy values
                 top_bars = sorted(bars, key=lambda b: b["cy"])[: max(1, len(bars)//2)]
 
-    # If beam_center_y given, filter to above it (smaller cy). Note: changed to beam_center_y - tol
+    # If beam_center_y given, filter to above it (smaller cy).
     if beam_center_y is not None:
         top_filtered = [b for b in top_bars if b["cy"] <= (beam_center_y - beam_center_tol)]
         if top_filtered:
@@ -238,7 +233,7 @@ def extract_bottom_reinforcement(results, beam_center_y=None,
     bar_pattern = re.compile(r"(\+?\d+)\s*-\s*(\d+)\s*\(([TCB])\)", re.IGNORECASE)
     bars = []
 
-    # Step 1: parse all reinforcement notations
+    # parse all reinforcement notations
     for text, score, box in results:
         if not text:
             continue
@@ -262,7 +257,7 @@ def extract_bottom_reinforcement(results, beam_center_y=None,
     if not bars:
         return reinforcement
 
-    # Step 2: filter for bottom bars (below/near centerline)
+    # filter for bottom bars (below/near centerline)
     if beam_center_y is not None:
         bottom_bars = [b for b in bars if b["cy"] >= (beam_center_y - beam_center_tol)]
     else:
@@ -273,13 +268,13 @@ def extract_bottom_reinforcement(results, beam_center_y=None,
         cutoff = (max(ys) + min(ys)) / 2.0
         bottom_bars = [b for b in bars if b["cy"] >= cutoff]
 
-    # Step 3: geometry split
+    # geometry split
     xmin, xmax = min(b["cx"] for b in bottom_bars), max(b["cx"] for b in bottom_bars)
     width = xmax - xmin if xmax != xmin else 1.0
     mid_x = (xmin + xmax) / 2.0
     mid_tol = width * 0.10  # 10% of span considered "mid"
 
-    # Step 4: assign to regions based on rules
+    # assign to regions based on rules
     for b in bottom_bars:
         if b["pos"] == "T":
             # replicate in all three regions
@@ -298,12 +293,203 @@ def extract_bottom_reinforcement(results, beam_center_y=None,
             else:
                 reinforcement["RIGHT BOTTOM"].append(b["text"])
 
-    # Step 5: clean up (deduplicate + stringify)
     for k in reinforcement:
         reinforcement[k] = " , ".join(dict.fromkeys(reinforcement[k]))
 
     return reinforcement
 
+def extract_top_left_right_dist(results, beam_center_y=None, debug=False):
+    def _center(box):
+        xs = [p[0] for p in box]
+        ys = [p[1] for p in box]
+        return (float(np.mean(xs)), float(np.mean(ys)))
+
+    # collect y-range and (T)-label y/xs to place a top band
+    tbar_re = re.compile(r"\(T\)", re.IGNORECASE)
+    ys, tbar_ys, tbar_xs = [], [], []
+    for text, score, box in results:
+        if text is None or box is None or len(box) == 0:
+            continue
+        cx, cy = _center(box)
+        ys.append(cy)
+        if tbar_re.search(str(text)):
+            tbar_ys.append(cy)
+            tbar_xs.append(cx)
+
+    if not ys:
+        return {"LEFT AT (DIST)": "", "RIGHT AT (DIST)": ""}
+
+    y_min, y_max = min(ys), max(ys)
+    y_span = max(1.0, y_max - y_min)
+
+    # If (T) markers exist, make band narrow around their median
+    if tbar_ys:
+        tbar_ys.sort()
+        mid_idx = len(tbar_ys) // 2
+        band_center = (tbar_ys[mid_idx] if len(tbar_ys) % 2 == 1
+                       else 0.5 * (tbar_ys[mid_idx - 1] + tbar_ys[mid_idx]))
+        # make the band fairly tight around the (T) center to avoid bottom leakage
+        band_half = 0.12 * y_span  # narrower than before
+        band_top = max(y_min, band_center - band_half)
+        band_bottom = min(y_max, band_center + band_half)
+    else:
+        # when no (T) labels - assume top region is near image top, but still stricter
+        # earlier code used 0.35*y_span; reduce that to 0.28 for stricter behavior
+        cutoff = y_min + 0.28 * y_span
+        if beam_center_y is not None:
+            band_top = y_min
+            band_bottom = min(cutoff, beam_center_y - 0.06 * y_span)
+        else:
+            band_top, band_bottom = y_min, cutoff
+        band_center = 0.5 * (band_top + band_bottom)
+
+    # safety clamp: ensure band_bottom is not too low
+    band_bottom = min(band_bottom, y_min + 0.40 * y_span)
+
+    if debug:
+        print("y_min,y_max,y_span:", y_min, y_max, y_span)
+        print("band_top,bottom,center:", band_top, band_bottom, (band_top + band_bottom)/2.0)
+
+    # numeric-only raw candidates (same regex logic)
+    num_only = re.compile(r"^\s*(\d{3,5})\s*$")
+    num_loose = re.compile(r"(?<!\d)(\d[\d\s]{2,6})(?!\d)")
+    raw_cands = []
+    for text, score, box in results:
+        if text is None or box is None or len(box) == 0:
+            continue
+        t = str(text)
+        m = num_only.match(t) or num_loose.search(t)
+        if not m:
+            continue
+        val = int(re.sub(r"\s+", "", m.group(1)))
+        if not (200 <= val <= 6000):
+            continue
+        cx, cy = _center(box)
+        raw_cands.append((val, cx, cy, float(score or 0)))
+
+    if not raw_cands:
+        return {"LEFT AT (DIST)": "", "RIGHT AT (DIST)": ""}
+
+    # keep only raw candidates inside the top band (strict)
+    top_band_cands = [c for c in raw_cands if band_top <= c[2] <= band_bottom]
+
+    # If nothing falls strictly inside the top band, allow a small tolerance upward (avoid picking bottom)
+    if not top_band_cands:
+        tol = 0.06 * y_span  # small tolerance
+        top_band_cands = [c for c in raw_cands if (band_top - tol) <= c[2] <= (band_bottom + tol)]
+
+    if not top_band_cands:
+        y_cut = y_min + 0.30 * y_span
+        top_band_cands = [c for c in raw_cands if c[2] <= y_cut]
+
+    if not top_band_cands:
+        return {"LEFT AT (DIST)": "", "RIGHT AT (DIST)": ""}
+
+    # vertical clustering (group numerics into horizontal bands)
+    top_band_cands.sort(key=lambda c: c[2])  # sort by cy
+    clusters = []
+    gap_thresh = 0.10 * y_span
+    current = [top_band_cands[0]]
+    for c in top_band_cands[1:]:
+        if c[2] - current[-1][2] <= gap_thresh:
+            current.append(c)
+        else:
+            clusters.append(current)
+            current = [c]
+    clusters.append(current)
+
+    # compute cluster stats: mean_y and size
+    cluster_info = [(sum(ci[2] for ci in cl) / len(cl), len(cl), cl) for cl in clusters]
+
+    # pick cluster closest to band_center (prefer larger cluster on tie)
+    cluster_info.sort(key=lambda x: (abs(x[0] - band_center), -x[1]))
+    chosen_mean_y, chosen_size, chosen_cluster = cluster_info[0]
+
+    # final safety: ensure chosen cluster is reasonably inside the top region
+    if chosen_mean_y > band_top + 0.25 * y_span:
+        # if cluster's mean is too low (i.e., likely bottom strip), pick the topmost cluster instead
+        cluster_info.sort(key=lambda x: (x[0], -x[1]))
+        chosen_cluster = cluster_info[0][2]
+
+    cands = chosen_cluster
+
+    if debug:
+        print("clusters:", [(round(ci[0],1), ci[1]) for ci in cluster_info])
+        print("chosen_mean_y, size:", chosen_mean_y, chosen_size)
+        print("final candidate ys:", [round(c[2],1) for c in cands])
+
+    xs = [cx for _, cx, _, _ in cands]
+    xmin, xmax = min(xs), max(xs)
+    width = max(1.0, xmax - xmin)
+
+    # beam midline (from (T) labels if available, else candidates)
+    if tbar_xs:
+        mid_x = 0.5 * (min(tbar_xs) + max(tbar_xs))
+        left_T = max([x for x in tbar_xs if x < mid_x], default=None)
+        right_T = min([x for x in tbar_xs if x > mid_x], default=None)
+    else:
+        mid_x = 0.5 * (xmin + xmax)
+        left_T, right_T = None, None
+
+    # scoring & pick per side
+    def pick_side(side):
+        side_cands = [c for c in cands if (c[1] < mid_x if side == "left" else c[1] > mid_x)]
+        if not side_cands:
+            return ""
+
+        anchor_x = left_T if side == "left" else right_T
+
+        # if we have an anchor, check if any candidates live near it
+        near_anchor = []
+        if anchor_x is not None:
+            near_anchor = [c for c in side_cands if abs(c[1] - anchor_x) <= 0.22 * width]
+
+        use_edge_bias = (len(near_anchor) == 0)
+
+        best_val, best_score = None, -1e9
+        for val, cx, cy, sc in side_cands:
+            s = -abs(cx - mid_x) / width  # closer to overall midline
+
+            # strong attraction to the side's (T) anchor if present
+            if anchor_x is not None:
+                s += -0.90 * abs(cx - anchor_x) / width
+
+            # vertical closeness to band center
+            s += -0.20 * abs(cy - band_center) / y_span
+
+            # edge rescue bias ONLY when nothing is near the anchor on this side
+            if use_edge_bias:
+                if side == "left":
+                    s += 0.10 * (1.0 - (cx - xmin) / width)
+                else:
+                    s += 0.10 * ((cx - xmin) / width)
+
+            # prefer round dimensions
+            if val % 50 == 0:
+                s += 0.15
+            elif val % 25 == 0:
+                s += 0.08
+
+            # OCR confidence
+            s += 0.05 * sc
+
+            if s > best_score:
+                best_score, best_val = s, val
+
+        return best_val if best_val is not None else ""
+
+    left_val = pick_side("left")
+    right_val = pick_side("right")
+
+    # robust fallbacks
+    if left_val == "" or right_val == "":
+        alt_mid = 0.5 * (xmin + xmax)
+        if left_val == "":
+            left_val = left_val or max([c for c in cands if c[1] < alt_mid], default=(None,))[0] or ""
+        if right_val == "":
+            right_val = right_val or max([c for c in cands if c[1] > alt_mid], default=(None,))[0] or ""
+
+    return {"LEFT AT (DIST)": left_val or "", "RIGHT AT (DIST)": right_val or ""}
 
 
 def _extract_shear_stirrups_spacing(results):
@@ -340,7 +526,7 @@ def _extract_shear_stirrups_spacing(results):
     if not stirrup_matches:
         return spacing
 
-    # CASE 1: Only one spacing OR "ALL" → mid only
+    # CASE 1: Only one spacing OR "ALL" --- mid only
     if len(stirrup_matches) == 1 or any("ALL" in s[3].upper() for s in stirrup_matches):
         dia, spc, _, _ = stirrup_matches[0]
         spacing["SHEAR STIRRUPS DIA (M)"] = dia
@@ -424,7 +610,6 @@ def extract_shear_stirrups(results):
     return spacing
 
 def _collect_value_points(results):
-    """Points that represent 'values' we want to associate with a single beam."""
     pats = [
         re.compile(r"\d+-\d+\([TC]\)", re.IGNORECASE),  # bars like 2-12(T)
         re.compile(r"(\d+)@(\d+)", re.IGNORECASE),      # stirrup spacing
@@ -438,7 +623,6 @@ def _collect_value_points(results):
     return pts
 
 def _select_primary_beam(beam_candidates, results):
-    """Choose exactly one beam per image, the one closest to the value cluster."""
     if not beam_candidates:
         return None
     if len(beam_candidates) == 1:
@@ -506,15 +690,15 @@ def process_image(image_path):
     shear  = extract_shear_stirrups(res)
     top_reinf = extract_top_reinforcement(res, beam_center_y=chosen.get("_cy"))
     bottom_reinf = extract_bottom_reinforcement(res, beam_center_y=chosen.get("_cy"))
+    top_dist = extract_top_left_right_dist(res, beam_center_y=chosen.get("_cy"))
 
     # build a single row for the chosen beam
-    row = {**{h:"" for h in HEADERS}, **chosen, **shear, **top_reinf, **bottom_reinf}
+    row = {**{h:"" for h in HEADERS}, **chosen, **shear, **top_reinf, **bottom_reinf, **top_dist}
     # strip helper keys
     row.pop("_cx", None); row.pop("_cy", None); row.pop("_has_wd", None)
 
     df_new = pd.DataFrame([row], columns=HEADERS)
 
-    # append/merge into Excel
     _merge_into_excel(df_new)
     print(f"Saved/updated: {row['BEAM NO']} -> {OUTPUT_XLSX}")
 
@@ -525,7 +709,6 @@ def process_image(image_path):
 
 if __name__ == "__main__":
     folder_path = "temp" 
-    # Loop through all files in the folder
     for fname in sorted(os.listdir(folder_path)):
         if fname.lower().endswith((".png", ".jpg", ".jpeg")):
             image_path = os.path.join(folder_path, fname)
