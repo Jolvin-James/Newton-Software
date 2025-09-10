@@ -2,6 +2,7 @@ import pandas as pd
 import re
 import os
 import numpy as np
+from statistics import median
 from paddleocr import PaddleOCR
 
 DEBUG = False
@@ -17,6 +18,10 @@ HEADERS = [
     "CONTINUOUS END","DISCONTINUOUS END","ATTACH MASTER ID"
 ]
 
+def _natural_key(s: str):
+    parts = re.split(r'(\d+)', s)
+    return [int(p) if p.isdigit() else p.lower() for p in parts]
+
 def init_ocr():
     return PaddleOCR(lang='en', use_textline_orientation=False, 
                      use_doc_orientation_classify=False, use_doc_unwarping=False)
@@ -31,8 +36,19 @@ def run_ocr(ocr, image_path):
     boxes = res.get('rec_polys', [])
     return list(zip(texts, scores, boxes))
 
-def filter_results(ocr_results, score_threshold=0.7):
-    return [item for item in ocr_results if item[1] >= score_threshold]
+# def filter_results(ocr_results, score_threshold=0.7):
+#     return [item for item in ocr_results if item[1] >= score_threshold]
+def filter_results(ocr_results, score_threshold=0.6, debug=False):
+    if ocr_results is None:
+        return []
+    filtered = [item for item in ocr_results if (item[1] or 0.0) >= score_threshold]
+    if debug:
+        print(f"[DEBUG] OCR raw count: {len(ocr_results)}, filtered (thr={score_threshold}): {len(filtered)}")
+        # show first few entries for inspection
+        for i, it in enumerate(ocr_results[:15]):
+            txt, sc, box = it
+            print(f"[DEBUG] raw[{i}]: text={repr(txt)}, score={sc}, box_len={len(box) if box is not None else 0}")
+    return filtered
 
 def _center(box):
     xs = [p[0] for p in box]
@@ -76,10 +92,9 @@ def extract_beam_numbers_and_sizes(results):
 def extract_top_reinforcement(results, beam_center_y=None,
                               min_cluster_separation_ratio=0.08,
                               top_fraction_fallback=0.40,
-                              beam_center_tol=2.0):
-
+                              beam_center_tol=2.0,
+                              debug=False):
     bar_pattern = re.compile(r"(\+?\d+)\s*-\s*(\d+)\s*\(([TC])\)", re.IGNORECASE)
-
 
     bars = []
     for text, score, box in results:
@@ -91,7 +106,11 @@ def extract_top_reinforcement(results, beam_center_y=None,
                 count = int(count_raw.replace("+", ""))
             except Exception:
                 count = count_raw
-            cx, cy = _center(box)
+            try:
+                cx, cy = _center(box)
+            except Exception:
+                # skip malformed box
+                continue
             normalized = f"{count}-{dia}({pos.upper()})"
             bars.append({
                 "text": normalized,
@@ -100,7 +119,10 @@ def extract_top_reinforcement(results, beam_center_y=None,
                 "pos": pos.upper(),  # 'T' or 'C'
                 "cx": cx, "cy": cy
             })
-        
+
+    if debug:
+        print(f"[DEBUG] found {len(bars)} reinforcement bar tokens")
+
     if not bars:
         return {"LEFT TOP": "", "MID TOP": "", "RIGHT TOP": ""}
 
@@ -112,9 +134,10 @@ def extract_top_reinforcement(results, beam_center_y=None,
     # If only one bar, treat it as top (fallback)
     if len(bars) == 1:
         top_bars = bars.copy()
+        if debug:
+            print("[DEBUG] single bar detected, treat as top")
     else:
         # 1D two-cluster (k=2) iterative assignment on cy
-        # init centers
         c1 = ymin
         c2 = ymax
         for _ in range(20):
@@ -123,6 +146,7 @@ def extract_top_reinforcement(results, beam_center_y=None,
             new_c1 = sum(b["cy"] for b in cluster1) / len(cluster1) if cluster1 else c1
             new_c2 = sum(b["cy"] for b in cluster2) / len(cluster2) if cluster2 else c2
             if abs(new_c1 - c1) < 1e-3 and abs(new_c2 - c2) < 1e-3:
+                cluster1, cluster2 = cluster1, cluster2
                 break
             c1, c2 = new_c1, new_c2
 
@@ -133,25 +157,35 @@ def extract_top_reinforcement(results, beam_center_y=None,
         other_cluster = cluster2 if top_cluster is cluster1 else cluster1
         center_dist = abs(center1 - center2)
 
+        if debug:
+            print(f"[DEBUG] top clustering centers: center1={center1:.1f}, center2={center2:.1f}, center_dist={center_dist:.1f}")
+
         # accept clustering only if cluster centers are sufficiently separated relative to y_range
         if center_dist >= (min_cluster_separation_ratio * y_range):
             top_bars = top_cluster
+            if debug:
+                print(f"[DEBUG] accepted two-cluster split, top cluster size: {len(top_bars)}")
         else:
             # fallback: take bars in top X% of the Y range
             cutoff = ymin + top_fraction_fallback * y_range
             top_bars = [b for b in bars if b["cy"] <= cutoff]
+            if debug:
+                print(f"[DEBUG] cluster separation too small, falling back to top_fraction cut (= {top_fraction_fallback}) -> chosen {len(top_bars)} bars")
             if not top_bars:
                 # take the half with smaller cy values
                 top_bars = sorted(bars, key=lambda b: b["cy"])[: max(1, len(bars)//2)]
+                if debug:
+                    print(f"[DEBUG] fallback to top half -> {len(top_bars)} bars")
 
     # If beam_center_y given, filter to above it (smaller cy).
     if beam_center_y is not None:
         top_filtered = [b for b in top_bars if b["cy"] <= (beam_center_y - beam_center_tol)]
         if top_filtered:
+            if debug:
+                print(f"[DEBUG] filtered top bars by beam_center_y -> {len(top_filtered)} remain (tol={beam_center_tol})")
             top_bars = top_filtered
-        # if filtering removed everything, keep previously computed top_bars (don't force empty)
 
-    # Now assign to left/mid/right by x-position
+    # assign to left/mid/right by x-position
     top_bars.sort(key=lambda b: b["cx"])
     xs = [b["cx"] for b in top_bars]
     xmin = min(xs); xmax = max(xs)
@@ -178,13 +212,17 @@ def extract_top_reinforcement(results, beam_center_y=None,
             else:
                 reinforcement[f"{r} TOP"].append(b["text"])
         elif b["pos"] == "C":
-            # allow C values in LEFT or RIGHT only, but if OCR put it with a T in same spot
             if r in ("LEFT", "RIGHT"):
                 reinforcement[f"{r} TOP"].append(b["text"])
 
     # deduplicate per region
     for k in reinforcement:
-        reinforcement[k] = list(dict.fromkeys(reinforcement[k]))  # keep as list
+        # keep order but remove duplicates
+        seen = []
+        for v in reinforcement[k]:
+            if v not in seen:
+                seen.append(v)
+        reinforcement[k] = seen
 
     # If exactly one distinct T bar was detected, treat it as global top.
     distinct_t_texts = {b["text"] for b in top_bars if b["pos"] == "T"}
@@ -194,10 +232,12 @@ def extract_top_reinforcement(results, beam_center_y=None,
             for reg in reinforcement:
                 if only_t not in reinforcement[reg]:
                     reinforcement[reg].append(only_t)
+            if debug:
+                print("[DEBUG] single distinct T bar found -> replicated across regions")
 
-    # replicate near-mid top T bars across all three 
+    # replicate near-mid top T bars across all three
     mid_x = (xmin + xmax) / 2.0
-    mid_tol = width * 0.25   # allow ±25% of width around center
+    mid_tol = width * 0.25
     for b in top_bars:
         if b["pos"] == "T" and abs(b["cx"] - mid_x) <= mid_tol:
             for reg in reinforcement:
@@ -213,18 +253,23 @@ def extract_top_reinforcement(results, beam_center_y=None,
             if val not in reinforcement["RIGHT TOP"]:
                 reinforcement["RIGHT TOP"].append(val)
 
-    # special case: if only T bars exist but they ended up only in one region,
-    # replicate them across all three
+    # special case: if only T bars exist but they ended up only in one region, replicate them across all three
     if any(v for v in reinforcement.values()):
         filled = [k for k, v in reinforcement.items() if v]
         if len(filled) == 1:
             only_vals = reinforcement[filled[0]]
-            reinforcement = {k: only_vals[:] for k in reinforcement.keys()} 
+            reinforcement = {k: only_vals[:] for k in reinforcement.keys()}
+            if debug:
+                print("[DEBUG] values present in only one region -> replicated to all regions")
 
-    # convert lists into comma-joined strings 
+    # convert lists into comma-joined strings
     reinforcement = {k: " , ".join(v) if v else "" for k, v in reinforcement.items()}
 
+    if debug:
+        print(f"[DEBUG] final top reinforcement: {reinforcement}")
+
     return reinforcement
+
 
 def extract_bottom_reinforcement(results, beam_center_y=None,
                                  bottom_fraction_fallback=0.40,
@@ -491,6 +536,95 @@ def extract_top_left_right_dist(results, beam_center_y=None, debug=False):
 
     return {"LEFT AT (DIST)": left_val or "", "RIGHT AT (DIST)": right_val or ""}
 
+def extract_bottom_left_right_dist(results, beam_center_y=None, debug=False):
+    import re
+    from statistics import median
+
+    def _center(box):
+        xs = [p[0] for p in box]
+        ys = [p[1] for p in box]
+        return float(sum(xs) / len(xs)), float(sum(ys) / len(ys))
+
+    strict_num = re.compile(r"^\s*(\d{2,5})\s*$")
+    nxm = re.compile(r"\b\d+\s*[xX]\s*\d+\b")
+
+    MIN_SCORE = 0.15
+    MIN_VAL = 200
+    MAX_VAL = 6000
+    MIN_CENTER_SEP = 20.0
+    MIN_X_SPAN = 60.0
+    BOTTOM_BAND_RATIO = 0.60   
+
+    cands = []
+
+    for item in results:
+        try:
+            text, score, box = item
+        except Exception:
+            continue
+        if text is None or box is None:
+            continue
+        t = str(text).strip()
+        if nxm.search(t):
+            continue
+        m = strict_num.match(t)
+        if not m:
+            continue
+        val = int(m.group(1))
+        if not (MIN_VAL <= val <= MAX_VAL):
+            continue
+        try:
+            cx, cy = _center(box)
+        except Exception:
+            continue
+        s = 0.0 if score is None else float(score)
+        if s < MIN_SCORE:
+            continue
+        cands.append({"val": val, "cx": cx, "cy": cy, "score": s})
+
+    if not cands:
+        return {"BOTTOM LEFT AT (DIST)": "", "BOTTOM RIGHT AT (DIST)": ""}
+
+    ys = [c["cy"] for c in cands]
+    y_min, y_max = min(ys), max(ys)
+    y_span = max(1.0, y_max - y_min)
+    bottom_threshold = y_min + (1.0 - BOTTOM_BAND_RATIO) * y_span
+    bottom_cands = [c for c in cands if c["cy"] >= bottom_threshold]
+
+    # fallback: if bottom band empty, use all candidates
+    if not bottom_cands:
+        bottom_cands = cands
+
+    all_xs = sorted([c["cx"] for c in bottom_cands])
+    mid_x = (min(all_xs) + max(all_xs)) / 2.0
+    left_members = [c for c in bottom_cands if c["cx"] <= mid_x]
+    right_members = [c for c in bottom_cands if c["cx"] > mid_x]
+
+    if not left_members or not right_members:
+        return {"BOTTOM LEFT AT (DIST)": "", "BOTTOM RIGHT AT (DIST)": ""}
+
+    left_center = median([m["cx"] for m in left_members])
+    right_center = median([m["cx"] for m in right_members])
+    center_sep = abs(right_center - left_center)
+    x_span = max(all_xs) - min(all_xs)
+
+    if center_sep < MIN_CENTER_SEP or x_span < MIN_X_SPAN:
+        return {"BOTTOM LEFT AT (DIST)": "", "BOTTOM RIGHT AT (DIST)": ""}
+
+    def best_for_side(members, target_center):
+        return min(members, key=lambda m: abs(m["cx"] - target_center))
+
+    left_best = best_for_side(left_members, left_center)
+    right_best = best_for_side(right_members, right_center)
+
+    if left_best is right_best:
+        return {"BOTTOM LEFT AT (DIST)": "", "BOTTOM RIGHT AT (DIST)": ""}
+
+    return {
+        "BOTTOM LEFT AT (DIST)": left_best["val"],
+        "BOTTOM RIGHT AT (DIST)": right_best["val"]
+    }
+
 
 def _extract_shear_stirrups_spacing(results):
     stirrup_pattern = re.compile(r"(\d+)@(\d+)", re.IGNORECASE)
@@ -584,7 +718,6 @@ def _extract_shear_stirrups_spacing(results):
     return spacing
 
 
-
 def extract_stirrup_legs(results):
     leg_patterns = [
         re.compile(r"(\d+)\s*[-]?\s*leg", re.IGNORECASE),     # 2-leg, 2 leg, 4legs
@@ -674,9 +807,38 @@ def _merge_into_excel(df_new):
         df_new.to_excel(OUTPUT_XLSX, index=False)
 
 def process_image(image_path):
-    ocr = init_ocr()
+    # ocr = init_ocr()
     raw = run_ocr(ocr, image_path)
-    res = filter_results(raw)
+
+    # print raw OCR size and sample immediately so we can see what's coming in
+    print(f"[INFO] OCR returned {len(raw)} raw items for {image_path}")
+    if DEBUG and len(raw) > 0:
+        print("[DEBUG] sample raw OCR items:")
+        for i, it in enumerate(raw[:12]):
+            txt, sc, box = it
+            print(f"  raw[{i}]: text={repr(txt)}, score={sc}, box_pts={len(box) if box is not None else 0}")
+
+    # lower threshold while debugging; pass debug flag in so filter prints counts
+    res = filter_results(raw, score_threshold=0.15, debug=DEBUG)
+
+    # also show filtered sample
+    if DEBUG:
+        print(f"[DEBUG] filtered OCR items count: {len(res)}")
+        for i, it in enumerate(res[:20]):
+            txt, sc, box = it
+            # safe check for box: explicit None + length check (works for lists and numpy arrays)
+            try:
+                has_points = (box is not None) and (hasattr(box, "__len__") and len(box) > 0)
+            except Exception:
+                has_points = False
+            if has_points:
+                try:
+                    cx_cy = _center(box)
+                except Exception:
+                    cx_cy = (None, None)
+            else:
+                cx_cy = (None, None)
+            print(f"  filtered[{i}]: text={repr(txt)}, score={sc}, cx_cy={cx_cy}")
 
     beam_candidates = extract_beam_numbers_and_sizes(res)
     if not beam_candidates:
@@ -687,13 +849,15 @@ def process_image(image_path):
     if not chosen:
         print("Could not select a primary beam."); return
 
+    # pass debug flag through so the functions actually print debug info
     shear  = extract_shear_stirrups(res)
-    top_reinf = extract_top_reinforcement(res, beam_center_y=chosen.get("_cy"))
+    top_reinf = extract_top_reinforcement(res, beam_center_y=chosen.get("_cy"), debug=DEBUG)
     bottom_reinf = extract_bottom_reinforcement(res, beam_center_y=chosen.get("_cy"))
-    top_dist = extract_top_left_right_dist(res, beam_center_y=chosen.get("_cy"))
+    top_dist = extract_top_left_right_dist(res, beam_center_y=chosen.get("_cy"), debug=DEBUG)
+    bottom_dist = extract_bottom_left_right_dist(res, beam_center_y=chosen.get("_cy"), debug=DEBUG)
 
     # build a single row for the chosen beam
-    row = {**{h:"" for h in HEADERS}, **chosen, **shear, **top_reinf, **bottom_reinf, **top_dist}
+    row = {**{h:"" for h in HEADERS}, **chosen, **shear, **top_reinf, **bottom_reinf, **top_dist, **bottom_dist}
     # strip helper keys
     row.pop("_cx", None); row.pop("_cy", None); row.pop("_has_wd", None)
 
@@ -708,12 +872,14 @@ def process_image(image_path):
 #     process_image(image_path)
 
 if __name__ == "__main__":
+    ocr = init_ocr()
     folder_path = "temp" 
-    for fname in sorted(os.listdir(folder_path)):
-        if fname.lower().endswith((".png", ".jpg", ".jpeg")):
-            image_path = os.path.join(folder_path, fname)
-            print(f"\nProcessing: {fname}")
-            try:
-                process_image(image_path)
-            except Exception as e:
-                print(f"Error processing {fname}: {e}")
+    imgs = [f for f in os.listdir(folder_path)
+            if f.lower().endswith((".png", ".jpg", ".jpeg"))]
+    for fname in sorted(imgs, key=_natural_key):
+        image_path = os.path.join(folder_path, fname)
+        print(f"\nProcessing: {fname}")
+        try:
+            process_image(image_path)
+        except Exception as e:
+            print(f"Error processing {fname}: {e}")
